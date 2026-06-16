@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 MassIVE/GNPS Dataset Downloader
-Downloads mzML/mzXML files from one or more MassIVE datasets over FTP.
+Downloads mzML/mzXML files from one or more MassIVE datasets over FTP,
+falling back to RAW files when no mzML/mzXML files are found.
 
 FTP layout on massive-ftp.ucsd.edu:
     /v01/ … /v12/              <- global server version dirs
@@ -25,23 +26,31 @@ Usage:
 Resume:
     Completed datasets are appended to <o>/completed.log.
     Re-running the same command skips datasets already in that file.
-    Individual files are also skipped when local size == remote size.
     Use --no-resume to force re-downloading everything.
+
+Output:
+    Each dataset is streamed directly into <o>/<accession>.tar.zst.
+    Archive members are stored below a top-level <accession>/ directory.
 """
 
 import argparse
+import compression.zstd as zstd
 import datetime
 import ftplib
+import tarfile
 import sys
 import re
 import time
 from pathlib import Path
 from typing import Optional
 
-FTP_HOST       = "massive-ftp.ucsd.edu"
-TARGET_EXTS    = {".mzml", ".mzxml"}
-VERSION_RE     = re.compile(r"^v\d+$", re.IGNORECASE)
-COMPLETED_LOG  = "completed.log"
+FTP_HOST        = "massive-ftp.ucsd.edu"
+TARGET_EXTS     = {".mzml", ".mzxml"}
+RAW_TARGET_EXTS = {".raw"}
+VERSION_RE      = re.compile(r"^v\d+$", re.IGNORECASE)
+COMPLETED_LOG   = "completed.log"
+ARCHIVE_SUFFIX  = ".tar.zst"
+ZSTD_LEVEL      = 19
 
 # Files/folders whose path (case-insensitive) contains one of these words
 # as a whole word (not embedded inside another word) are excluded.
@@ -99,6 +108,12 @@ class Progress:
     def _render(self) -> str:
         elapsed = time.monotonic() - self._t0 or 1e-6
         speed   = self._done / elapsed
+        if self.total <= 0:
+            return (
+                f"  ↓ {self.label}  "
+                f"{_fmt_bytes(self._done)}  "
+                f"{_fmt_bytes(int(speed))}/s"
+            )
         frac    = self._done / self.total if self.total > 0 else 0.0
         eta     = (self.total - self._done) / speed if speed > 0 and self.total > 0 else -1
         pct     = f"{frac*100:5.1f}%"
@@ -230,9 +245,10 @@ def find_dataset_path(ftp: ftplib.FTP, accession: str) -> Optional[str]:
 # FTP walk + keyword filter
 # ---------------------------------------------------------------------------
 
-def walk_ftp(ftp: ftplib.FTP, remote_root: str) -> tuple[list[str], int]:
+def walk_ftp(ftp: ftplib.FTP, remote_root: str,
+             target_exts: set[str] = TARGET_EXTS) -> tuple[list[str], int]:
     """
-    Recursively collect mzML/mzXML paths under remote_root.
+    Recursively collect paths matching target_exts under remote_root.
     Returns (kept_paths, n_excluded).
     """
     kept:     list[str] = []
@@ -259,14 +275,14 @@ def walk_ftp(ftp: ftplib.FTP, remote_root: str) -> tuple[list[str], int]:
                 else:
                     queue.append(full)
             elif ftype == "file":
-                if Path(name).suffix.lower() in TARGET_EXTS:
+                if Path(name).suffix.lower() in target_exts:
                     if is_excluded(full):
                         print(f"[INFO]   Skipping file [{_matching_keyword(full)}]: …/{name}")
                         excluded += 1
                     else:
                         kept.append(full)
             else:
-                if Path(name).suffix.lower() in TARGET_EXTS:
+                if Path(name).suffix.lower() in target_exts:
                     if is_excluded(full):
                         excluded += 1
                     else:
@@ -275,6 +291,17 @@ def walk_ftp(ftp: ftplib.FTP, remote_root: str) -> tuple[list[str], int]:
                     queue.append(full)
 
     return kept, excluded
+
+
+def collect_target_files(ftp: ftplib.FTP, dataset_path: str,
+                         ignore_raw: bool = True) -> tuple[list[str], str, int]:
+    target_files, n_excluded = walk_ftp(ftp, dataset_path, TARGET_EXTS)
+    if target_files or ignore_raw:
+        return target_files, "mzML/mzXML", n_excluded
+
+    print("[INFO] No mzML/mzXML files found; checking RAW files instead.")
+    raw_files, raw_excluded = walk_ftp(ftp, dataset_path, RAW_TARGET_EXTS)
+    return raw_files, "RAW", raw_excluded
 
 
 def _matching_keyword(path: str) -> str:
@@ -287,20 +314,19 @@ def _matching_keyword(path: str) -> str:
 # Download (sequential, with live progress bar)
 # ---------------------------------------------------------------------------
 
-def get_remote_size(ftp: ftplib.FTP, path: str) -> int:
-    """Returns file size, or -1 if the server doesn't support SIZE. Lets network
-    errors propagate so callers can detect a dead connection."""
-    try:
-        size = ftp.size(path)
-        return size if size is not None else -1
-    except ftplib.error_perm:
-        # Server replied with a permanent error (e.g. SIZE not supported) — not a
-        # connection problem, just unknown size.
-        return -1
-    # All other exceptions (OSError, EOFError, ftplib.error_temp …) propagate.
-
-
 CHUNK = 256 * 1024   # 256 KB — balances progress granularity vs syscall overhead
+
+
+def _archive_member_name(accession: str, dataset_path: str, remote_path: str) -> str:
+    return f"{accession}/{strip_prefix(remote_path, dataset_path)}"
+
+
+def _add_archive_root(archive: tarfile.TarFile, accession: str) -> None:
+    root = tarfile.TarInfo(f"{accession}/")
+    root.type = tarfile.DIRTYPE
+    root.mode = 0o755
+    root.mtime = int(time.time())
+    archive.addfile(root)
 
 
 def _is_broken_pipe(exc: Exception) -> bool:
@@ -310,29 +336,10 @@ def _is_broken_pipe(exc: Exception) -> bool:
 
 def download_file(ftp: ftplib.FTP, remote_path: str, local_path: Path,
                   retries: int = 3) -> tuple[ftplib.FTP, bool, str]:
-    """
-    Download remote_path → local_path, reconnecting and retrying on broken-pipe
-    or connection-reset errors.
-
-    Returns (ftp, success, message) — ftp may be a new connection if the old
-    one was dead, so callers must use the returned reference.
-    """
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     for attempt in range(1, retries + 1):
-        try:
-            remote_size = get_remote_size(ftp, remote_path)
-        except Exception:
-            # Control connection is dead — reconnect before anything else
-            try: ftp.close()
-            except Exception: pass
-            ftp = connect_anon()
-            remote_size = get_remote_size(ftp, remote_path)
-
-        if local_path.exists() and remote_size > 0 and local_path.stat().st_size == remote_size:
-            return ftp, True, "SKIPPED (already complete)"
-
-        progress = Progress(local_path.name, remote_size)
+        progress = Progress(local_path.name, -1)
 
         try:
             with open(local_path, "wb") as fh:
@@ -354,6 +361,80 @@ def download_file(ftp: ftplib.FTP, remote_path: str, local_path: Path,
                 print(f"  [WARN] Connection lost: {type(exc).__name__}: {exc}")
                 print(f"  [WARN] File was: ftp://{FTP_HOST}{remote_path}")
                 print(f"  [WARN] Reconnecting in {wait}s (attempt {attempt}/{retries}) …")
+                time.sleep(wait)
+                try: ftp.close()
+                except Exception: pass
+                ftp = connect_anon()
+            else:
+                return ftp, False, f"FAILED — {exc}"
+
+    return ftp, False, "FAILED — max retries exceeded"
+
+
+def _remove_empty_parents(path: Path, stop: Path) -> None:
+    current = path.parent
+    while True:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        if current == stop:
+            break
+        current = current.parent
+
+
+def write_archive(ftp: ftplib.FTP, target_files: list[str], dataset_path: str,
+                  accession: str, archive_path: Path,
+                  delay: float = 0.0) -> ftplib.FTP:
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path = archive_path.with_name(f"{archive_path.name}.part")
+    output_dir = archive_path.parent / accession
+    part_path.unlink(missing_ok=True)
+
+    try:
+        with zstd.open(part_path, "wb", level=ZSTD_LEVEL) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w|") as archive:
+                _add_archive_root(archive, accession)
+                total = len(target_files)
+
+                for i, remote_path in enumerate(target_files, 1):
+                    rel = strip_prefix(remote_path, dataset_path)
+                    sys.stdout.write(f"\n  [{i}/{total}] {rel}\r")
+                    sys.stdout.flush()
+
+                    local_path = output_dir / rel
+                    ftp, success, msg = download_file(ftp, remote_path, local_path)
+                    if not success:
+                        raise RuntimeError(f"{rel}: {msg}")
+
+                    try:
+                        archive.add(local_path, arcname=_archive_member_name(accession, dataset_path, remote_path))
+                    finally:
+                        local_path.unlink(missing_ok=True)
+                        _remove_empty_parents(local_path, output_dir)
+
+                    if delay > 0 and i < total:
+                        time.sleep(delay)
+
+        part_path.replace(archive_path)
+        return ftp
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
+
+
+def download_archive(ftp: ftplib.FTP, target_files: list[str], dataset_path: str,
+                     accession: str, archive_path: Path, delay: float,
+                     retries: int = 3) -> tuple[ftplib.FTP, bool, str]:
+    for attempt in range(1, retries + 1):
+        try:
+            ftp = write_archive(ftp, target_files, dataset_path, accession, archive_path, delay)
+            return ftp, True, "OK"
+        except Exception as exc:
+            if _is_broken_pipe(exc) and attempt < retries:
+                wait = 5 * attempt
+                print(f"  [WARN] Connection lost: {type(exc).__name__}: {exc}")
+                print(f"  [WARN] Restarting archive in {wait}s (attempt {attempt}/{retries}) …")
                 time.sleep(wait)
                 try: ftp.close()
                 except Exception: pass
@@ -395,21 +476,42 @@ def mark_completed(log_path: Path, accession: str) -> None:
 
 def parse_accessions(args) -> list[str]:
     raw: list[str] = []
+    selected_file_lines = 0
     if args.accession:
         raw.append(args.accession)
     if args.file:
         p = Path(args.file)
         if not p.exists():
             sys.exit(f"[ERROR] ID file not found: {p}")
-        for line in p.read_text().splitlines():
+        from_line = getattr(args, "from_line", None)
+        to_line = getattr(args, "to_line", None)
+        if from_line is not None and from_line < 1:
+            sys.exit("[ERROR] --from-line must be >= 1.")
+        if to_line is not None and to_line < 1:
+            sys.exit("[ERROR] --to-line must be >= 1.")
+        if from_line is not None and to_line is not None and from_line > to_line:
+            sys.exit("[ERROR] --from-line cannot be greater than --to-line.")
+
+        for line_no, line in enumerate(p.read_text().splitlines(), 1):
+            if from_line is not None and line_no < from_line:
+                continue
+            if to_line is not None and line_no > to_line:
+                continue
+            selected_file_lines += 1
             line = line.strip()
             if line and not line.startswith("#"):
                 raw.append(line)
 
+        if not args.accession and selected_file_lines == 0:
+            if from_line is not None or to_line is not None:
+                range_label = f"{from_line or 1}..{to_line or 'EOF'}"
+                sys.exit(f"[ERROR] No accessions found in selected file lines: {range_label}")
+            sys.exit(f"[ERROR] No accessions found in file: {p}")
+
     seen, result = set(), []
     for acc in raw:
         acc = acc.upper()
-        if not re.match(r"^MSV\d+$", acc):
+        if not re.match(r"^MSV\d{9}$", acc):
             print(f"[WARN] Invalid accession '{acc}' — skipping.")
             continue
         if acc not in seen:
@@ -426,13 +528,13 @@ def parse_accessions(args) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def download_dataset(accession: str, output_root: Path,
-                     dry_run: bool, delay: float) -> bool:
-    output_dir = output_root / accession
+                     dry_run: bool, delay: float, ignore_raw: bool) -> bool:
+    archive_path = output_root / f"{accession}{ARCHIVE_SUFFIX}"
     print(f"\n{'='*60}")
     print(f"[INFO] Dataset : {accession}")
     print(f"[INFO] FTP URL : ftp://{FTP_HOST}/{accession}/")
     print(f"[INFO] Browse  : https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?task={accession}")
-    print(f"[INFO] Output  : {output_dir}")
+    print(f"[INFO] Output  : {archive_path}")
 
     ftp          = connect_anon()
     dataset_path = find_dataset_path(ftp, accession)
@@ -441,17 +543,22 @@ def download_dataset(accession: str, output_root: Path,
         return False
 
     print(f"[INFO] Walking ftp://{FTP_HOST}{dataset_path}/ …")
-    target_files, n_excluded = walk_ftp(ftp, dataset_path)
+    target_files, file_kind, n_excluded = collect_target_files(
+        ftp, dataset_path, ignore_raw=ignore_raw
+    )
 
     if n_excluded:
         print(f"[INFO] Excluded {n_excluded} path(s) matching: {EXCLUDE_WORDS}")
     if not target_files:
-        print("[INFO] No mzML/mzXML files to download (raw-only or all excluded).")
+        if ignore_raw:
+            print("[INFO] No mzML/mzXML files to download (RAW fallback disabled).")
+        else:
+            print("[INFO] No mzML/mzXML or RAW files to download (all excluded or unavailable).")
         ftp.quit()
         return True
 
     total = len(target_files)
-    print(f"[INFO] {total} file(s) queued for download.")
+    print(f"[INFO] {total} {file_kind} file(s) queued for archive.")
 
     if dry_run:
         print("\n=== DRY RUN ===")
@@ -460,30 +567,16 @@ def download_dataset(accession: str, output_root: Path,
         ftp.quit()
         return True
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ok = fail = 0
-
-    for i, remote_path in enumerate(target_files, 1):
-        rel        = strip_prefix(remote_path, dataset_path)
-        local_path = output_dir / rel
-        sys.stdout.write(f"\n  [{i}/{total}] {rel}\r")
-        sys.stdout.flush()
-
-        ftp, success, msg = download_file(ftp, remote_path, local_path)
-        if not success:
-            print(f"  [✗] {msg}")
-            fail += 1
-        else:
-            if "SKIPPED" in msg:
-                print(f"  [–] {msg}")
-            ok += 1
-
-        if delay > 0 and i < total:
-            time.sleep(delay)
-
+    ftp, success, msg = download_archive(
+        ftp, target_files, dataset_path, accession, archive_path, delay
+    )
     ftp.quit()
-    print(f"\n[INFO] {accession}: {ok}/{total} OK, {fail} failed.")
-    return fail == 0
+    if success:
+        print(f"\n[INFO] {accession}: archived {total}/{total} file(s) to {archive_path}.")
+    else:
+        print(f"  [✗] {msg}")
+        print(f"\n[INFO] {accession}: archive failed.")
+    return success
 
 
 # ---------------------------------------------------------------------------
@@ -492,13 +585,15 @@ def download_dataset(accession: str, output_root: Path,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download mzML/mzXML files from MassIVE/GNPS datasets.",
+        description="Archive mzML/mzXML files from MassIVE/GNPS datasets, with optional RAW fallback.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python massive_downloader.py MSV000095785\n"
             "  python massive_downloader.py MSV000095785 --output ./data\n"
+            "  python massive_downloader.py MSV000095785 --no-ignore-raw --output ./data\n"
             "  python massive_downloader.py --file ids.txt --output ./data\n"
+            "  python massive_downloader.py --file ids.txt --from-line 2501 --to-line 3000 --output ./data\n"
             "  python massive_downloader.py --file ids.txt --dry-run\n"
         ),
     )
@@ -506,8 +601,14 @@ def main() -> None:
                         help="Single MassIVE accession, e.g. MSV000095785")
     parser.add_argument("--file", "-f", metavar="FILE",
                         help="Text file of accessions (one per line; # = comment)")
+    parser.add_argument("--from-line", type=int, default=None,
+                        help="Read --file starting at this 1-based line number (inclusive)")
+    parser.add_argument("--to-line", type=int, default=None,
+                        help="Read --file through this 1-based line number (inclusive)")
+    parser.add_argument("--ignore-raw", action=argparse.BooleanOptionalAction, default=True,
+                        help="Ignore RAW fallback when no mzML/mzXML files are found [default: true]")
     parser.add_argument("--output", "-o", default=".",
-                        help="Root output dir — files land in <o>/<accession>/… [default: .]")
+                        help="Root output dir — archives land in <o>/<accession>.tar.zst [default: .]")
     parser.add_argument("--dry-run", "-n", action="store_true",
                         help="List files that would be downloaded without fetching them")
     parser.add_argument("--delay", "-d", type=float, default=1.0,
@@ -518,6 +619,14 @@ def main() -> None:
 
     if not args.accession and not args.file:
         parser.error("Provide a single accession or --file with a list of accessions.")
+    if (args.from_line is not None or args.to_line is not None) and not args.file:
+        parser.error("--from-line/--to-line require --file.")
+    if args.from_line is not None and args.from_line < 1:
+        parser.error("--from-line must be >= 1.")
+    if args.to_line is not None and args.to_line < 1:
+        parser.error("--to-line must be >= 1.")
+    if args.from_line is not None and args.to_line is not None and args.from_line > args.to_line:
+        parser.error("--from-line cannot be greater than --to-line.")
 
     accessions  = parse_accessions(args)
     output_root = Path(args.output).resolve()
@@ -549,7 +658,9 @@ def main() -> None:
         print(f"  Manual check: ftp://{FTP_HOST}/{accession}/")
         print(f"  Dataset page: https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?task={accession}")
         try:
-            ok = download_dataset(accession, output_root, args.dry_run, args.delay)
+            ok = download_dataset(
+                accession, output_root, args.dry_run, args.delay, args.ignore_raw
+            )
         except Exception as exc:
             print(f"[ERROR] {accession}: {type(exc).__name__}: {exc}")
             ok = False
